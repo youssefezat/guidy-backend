@@ -1,16 +1,12 @@
 from fastapi import FastAPI
-from routing import get_shortest_path
+from routing import get_route_data, get_station_list
 
-app = FastAPI(title="Guidy Routing Engine")
+app = FastAPI(title="Guidy Full Stack Engine")
 
-@app.get("/")
-def read_root():
-    return {"status": "Guidy Backend is Live!", "version": "1.0.0"}
+@app.get("/api/stations")
+def fetch_stations():
+    return {"stations": get_station_list()}
 
 @app.get("/api/route")
 def calculate_route(start: str, end: str):
-    """
-    Example usage: /api/route?start=Opera&end=Al Shohadaa
-    """
-    result = get_shortest_path(start, end)
-    return result
+    return get_route_data(start, end)
