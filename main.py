@@ -35,3 +35,7 @@ def get_route(start_lat: float, start_lon: float, end_lat: float, end_lon: float
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
