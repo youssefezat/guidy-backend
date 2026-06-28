@@ -4,7 +4,6 @@ import time
 import math
 import heapq
 
-
 class GTFSRaptorEngine:
     def __init__(self, gtfs_folder_path):
         self.folder = gtfs_folder_path
@@ -12,19 +11,8 @@ class GTFSRaptorEngine:
         self.routes = {}
         self.trips = {}
         self.stop_times = defaultdict(list)
-        # CHANGED: graph now maps stop_id -> list of (neighbor_id, route_id, time_sec)
-        # instead of an unweighted set of (neighbor_id, route_id) pairs.
-        # time_sec is the REAL elapsed travel time between the two stops,
-        # taken directly from this trip's stop_times.txt timestamps -- not
-        # a hop-count or a flat per-step estimate.
         self.graph = defaultdict(list)
 
-        # NEW: walking-transfer radius for connecting physically co-located
-        # stops that have different stop_ids (e.g. a metro platform and a
-        # nearby microbus stop both serving "Helwan"). Without this, large
-        # parts of the network are invisibly disconnected from each other,
-        # since GTFS gives each agency/route its own stop_id even at the
-        # same real-world location.
         self.WALK_LINK_RADIUS_M = 350
         self.WALK_SPEED_MPS = 1.25  # ~4.5 km/h
 
@@ -41,9 +29,6 @@ class GTFSRaptorEngine:
 
     @staticmethod
     def _parse_gtfs_time(t):
-        """GTFS times can exceed 24:00:00 for trips that run past midnight,
-        so this can't just use datetime.strptime. Returns seconds since
-        midnight of the service day."""
         h, m, s = (int(x) for x in t.strip().split(':'))
         return h * 3600 + m * 60 + s
 
@@ -80,91 +65,54 @@ class GTFSRaptorEngine:
                 trip_id = row['trip_id']
                 stop_id = row['stop_id']
                 seq = int(row['stop_sequence'])
-                # CHANGED: also keep arrival/departure so we can compute
-                # real elapsed time between consecutive stops on this trip.
                 arr = row.get('arrival_time', '').strip()
                 dep = row.get('departure_time', '').strip()
                 self.stop_times[trip_id].append((stop_id, seq, arr, dep))
 
-        print("Constructing Node Network...")
-        # CHANGED: pick ONE representative trip per route (the first one
-        # encountered) instead of building edges from every trip variant.
-        # GTFS typically has several trips per route (different times of
-        # day / directions); since this build is a static, time-of-day-
-        # agnostic graph, using every trip just re-adds the same edges
-        # with minor timing noise. Using one representative trip per
-        # route/direction keeps the graph size sane and the timings clean.
-        seen_routes_built = set()
-
+        seen_edges = set()
         for trip_id, st_list in self.stop_times.items():
             route_id = self.trips.get(trip_id)
-            if not route_id:
-                continue
-            if route_id in seen_routes_built:
-                continue
-            seen_routes_built.add(route_id)
-
-            st_list.sort(key=lambda x: x[1])  # sort by stop_sequence
+            if not route_id: continue
+            st_list.sort(key=lambda x: x[1])
 
             for i in range(len(st_list) - 1):
                 u, _, _, u_dep = st_list[i]
                 v, _, v_arr, _ = st_list[i + 1]
 
-                if u not in self.stops or v not in self.stops:
-                    continue
+                if u not in self.stops or v not in self.stops: continue
 
-                # REAL travel time from GTFS timestamps, not a hop count.
+                edge_key = (u, v, route_id)
+                if edge_key in seen_edges: continue
+                
                 try:
                     t_dep = self._parse_gtfs_time(u_dep)
                     t_arr = self._parse_gtfs_time(v_arr)
-                    time_sec = max(t_arr - t_dep, 10)  # floor to avoid 0/negative from data noise
+                    time_sec = max(t_arr - t_dep, 10) 
                 except (ValueError, AttributeError):
-                    # Fallback if a timestamp is missing/malformed: estimate
-                    # from straight-line distance at a conservative 15 km/h,
-                    # clearly worse than real data but better than crashing.
                     dist_m = self._haversine(
                         self.stops[u]['lat'], self.stops[u]['lon'],
                         self.stops[v]['lat'], self.stops[v]['lon']
                     )
                     time_sec = max(dist_m / (15 * 1000 / 3600), 10)
 
-                # CHANGED: directed edges only (u -> v), not automatically
-                # added in both directions. Real bus/microbus routes are
-                # one-way; treating every hop as bidirectional invented
-                # return trips that don't exist. (Metro lines already have
-                # separate stop_ids per direction in this feed, so this
-                # doesn't break northbound/southbound metro travel.)
+                seen_edges.add(edge_key)
                 self.graph[u].append((v, route_id, time_sec))
-
-        transit_edge_count = sum(len(v) for v in self.graph.values())
-        print(f"Mapped {len(self.graph)} stops with {transit_edge_count} directed transit edges "
-              f"across {len(seen_routes_built)} routes.")
+                
+                edge_key_rev = (v, u, route_id)
+                if edge_key_rev not in seen_edges:
+                    seen_edges.add(edge_key_rev)
+                    self.graph[v].append((u, route_id, time_sec))
 
         self._add_interchange_edges()
-
         print(f"Engine Ready in {round(time.time() - start_time, 2)} seconds.")
 
     def _add_interchange_edges(self):
-        """
-        NEW: adds walking-transfer edges between distinct stop_ids that are
-        physically close together (e.g. a metro platform and a nearby
-        microbus stop). Without this, the graph is effectively several
-        disconnected sub-networks -- one per agency -- since GTFS gives
-        each agency/route its own stop_id even at shared real-world
-        locations. This is the "Interchange Edge" concept described in
-        the project's Trials & Justification document, Section 3.2.
-
-        Uses simple grid bucketing (not full O(n^2) comparison) to stay
-        fast even with 1000+ stops.
-        """
-        print("Adding interchange (walking transfer) edges...")
-        cell_deg = self.WALK_LINK_RADIUS_M / 111000  # rough meters-to-degrees at this latitude
+        cell_deg = self.WALK_LINK_RADIUS_M / 111000 
         grid = defaultdict(list)
         for stop_id, info in self.stops.items():
             key = (round(info['lon'] / cell_deg), round(info['lat'] / cell_deg))
             grid[key].append(stop_id)
 
-        added = 0
         seen_pairs = set()
         for (gx, gy), stop_ids in grid.items():
             neighbor_ids = []
@@ -175,11 +123,9 @@ class GTFSRaptorEngine:
 
             for s1 in stop_ids:
                 for s2 in candidates:
-                    if s1 >= s2:
-                        continue
+                    if s1 >= s2: continue
                     pair = (s1, s2)
-                    if pair in seen_pairs:
-                        continue
+                    if pair in seen_pairs: continue
                     seen_pairs.add(pair)
 
                     d_m = self._haversine(
@@ -190,9 +136,6 @@ class GTFSRaptorEngine:
                         walk_time = max(d_m / self.WALK_SPEED_MPS, 10)
                         self.graph[s1].append((s2, "WALK", walk_time))
                         self.graph[s2].append((s1, "WALK", walk_time))
-                        added += 1
-
-        print(f"Added {added * 2} directed walking-transfer edges ({added} bidirectional pairs).")
 
     def find_nearest_stop(self, lat, lon):
         min_distance = float('inf')
@@ -205,16 +148,12 @@ class GTFSRaptorEngine:
         return nearest_stop_id, min_distance
 
     def _get_route_color(self, route_type):
-        if route_type == '1':
-            return "#6DA4C2"
-        if route_type == '3':
-            return "#E29578"
+        if route_type == '1': return "#6DA4C2"
+        if route_type == '3': return "#E29578"
         return "#D4A373"
 
     def _format_route_name(self, route_id):
-        # NEW: handle the synthetic "WALK" route_id used by interchange edges.
-        if route_id == "WALK":
-            return "Walk"
+        if route_id == "WALK": return "Walk"
         route = self.routes[route_id]
         short_name = route['short_name']
         long_name = route['long_name']
@@ -231,58 +170,54 @@ class GTFSRaptorEngine:
                 return f"Bus Route {short_name}"
         return long_name if long_name else short_name
 
-    def _find_shortest_path(self, start_stop, end_stop):
-        """
-        Dijkstra over REAL travel-time weights (seconds), with a transfer
-        penalty added when the route_id changes between consecutive edges.
-
-        CHANGED from the original: cost is no longer `+1` per hop (which
-        made this mathematically equivalent to BFS -- "fewest stops" --
-        despite being implemented with a priority queue). Each edge now
-        contributes its actual GTFS-derived travel time in seconds, so the
-        algorithm genuinely optimizes for TIME, which is what "Dijkstra"
-        is supposed to buy you over BFS.
-        """
-        TRANSFER_PENALTY_SEC = 240  # ~4 minutes, matches the kind of real-world
-        # cost of walking to a new platform/road and waiting for the next vehicle
+    # THE FIX: MULTI-CRITERIA PATHFINDING
+    def _find_shortest_path(self, start_stop, end_stop, profile="fastest"):
+        # Default Weights
+        TRANSFER_PENALTY_SEC = 240 
+        WALK_PENALTY_MULT = 1.0
+        METRO_PENALTY_SEC = 0
+        
+        # Adjust weights to force the algorithm down different physical paths
+        if profile == "regular":
+            TRANSFER_PENALTY_SEC = 900 # Heavily penalize transfers to force single-seat bus rides
+            WALK_PENALTY_MULT = 1.5 
+        elif profile == "cheapest":
+            METRO_PENALTY_SEC = 1200 # Add artificial 20-min delay to Metro to force surface transport
 
         queue = [(0, start_stop, [])]
         visited = set()
+        
         while queue:
             cost, current, path = heapq.heappop(queue)
             if current == end_stop:
-                return path + [(current, None)]
-            if current in visited:
-                continue
+                return path + [(current, None)], cost
+            
+            if current in visited: continue
             visited.add(current)
+            
             for neighbor, route_id, time_sec in self.graph[current]:
                 if neighbor not in visited:
                     prev_route = path[-1][1] if path else None
-                    penalty = time_sec
-                    # Only charge a transfer penalty between two REAL transit
-                    # routes -- not when starting the very first leg, and not
-                    # for WALK edges, which represent a deliberate interchange
-                    # rather than an unplanned mode-switch.
-                    if (
-                        prev_route is not None
-                        and prev_route != route_id
-                        and prev_route != "WALK"
-                        and route_id != "WALK"
-                    ):
+                    
+                    actual_time = time_sec
+                    if route_id == "WALK":
+                        actual_time *= WALK_PENALTY_MULT
+                    
+                    penalty = actual_time
+                    
+                    if route_id != "WALK":
+                        rtype = self.routes.get(route_id, {}).get('type', '3')
+                        if rtype == '1':
+                            penalty += METRO_PENALTY_SEC
+
+                    if (prev_route is not None and prev_route != route_id 
+                        and prev_route != "WALK" and route_id != "WALK"):
                         penalty += TRANSFER_PENALTY_SEC
+                        
                     heapq.heappush(queue, (cost + penalty, neighbor, path + [(current, route_id)]))
-        return None
+        return None, 0
 
-    def run_raptor_by_coords(self, start_lat, start_lon, end_lat, end_lon):
-        calc_start_time = time.time()
-
-        start_stop_id, start_walk_meters = self.find_nearest_stop(start_lat, start_lon)
-        end_stop_id, end_walk_meters = self.find_nearest_stop(end_lat, end_lon)
-
-        path = self._find_shortest_path(start_stop_id, end_stop_id)
-        if not path:
-            return {"success": False, "error": "No viable transit route found between these locations."}
-
+    def _build_option_data(self, path, profile_type, start_stop_id, start_lat, start_lon, end_lat, end_lon, start_walk_meters, end_walk_meters):
         segments = []
         instructions = []
         station_markers = []
@@ -301,9 +236,11 @@ class GTFSRaptorEngine:
         current_route = None
         transit_points = []
         transit_distance = 0
-        # NEW: accumulate REAL transit time as we walk the path, instead of
-        # estimating it afterwards from hop count.
         total_transit_time_sec = 0
+        
+        metro_stops = 0
+        bus_boardings = 0
+        boarded_routes = set()
 
         for i in range(len(path) - 1):
             curr_stop, route = path[i]
@@ -316,15 +253,15 @@ class GTFSRaptorEngine:
 
             transit_distance += self._haversine(stop_info['lat'], stop_info['lon'], next_info['lat'], next_info['lon'])
 
-            # Look up the real edge time for this specific hop (route-aware,
-            # since the same two stops could theoretically be linked by more
-            # than one route/edge).
-            edge_time = next(
-                (t for n, r, t in self.graph[curr_stop] if n == next_stop and r == route),
-                None
-            )
-            if edge_time is not None:
-                total_transit_time_sec += edge_time
+            edge_time = next((t for n, r, t in self.graph[curr_stop] if n == next_stop and r == route), 10)
+            total_transit_time_sec += edge_time
+
+            if route != "WALK":
+                route_type = self.routes.get(route, {}).get('type', '3')
+                if route_type == '1': metro_stops += 1
+                elif route not in boarded_routes:
+                    bus_boardings += 1
+                    boarded_routes.add(route)
 
             if route != current_route:
                 if current_route is not None:
@@ -335,14 +272,12 @@ class GTFSRaptorEngine:
                     else:
                         title, subtitle = "Transfer Station", f"Change to {self._format_route_name(route)}"
                     instructions.append({
-                        "title": title,
-                        "subtitle": subtitle,
+                        "title": title, "subtitle": subtitle,
                         "lat": stop_info['lat'], "lon": stop_info['lon'],
                         "station": stop_info['name']
                     })
                     transit_points = [{"lat": stop_info['lat'], "lon": stop_info['lon']}]
                 else:
-                    verb = "Walk" if route == "WALK" else "Board Transit"
                     action = self._format_route_name(route) if route != "WALK" else "to the next stop"
                     instructions.append({
                         "title": "Walk" if route == "WALK" else "Board Transit",
@@ -357,6 +292,7 @@ class GTFSRaptorEngine:
         station_markers.append({"lat": self.stops[last_stop]['lat'], "lon": self.stops[last_stop]['lon']})
         last_route_type = "1" if current_route == "WALK" else self.routes.get(current_route, {}).get('type', '3')
         segments.append({"color": self._get_route_color(last_route_type) if current_route != "WALK" else "#2A9D8F", "points": transit_points})
+        
         instructions.append({
             "title": "Arrive & Disembark",
             "subtitle": f"Get off at {self.stops[last_stop]['name']}",
@@ -375,33 +311,71 @@ class GTFSRaptorEngine:
             "station": "Destination"
         })
 
-        # CHANGED: total time is now real walk time (distance / walking
-        # speed) + REAL accumulated transit time from GTFS timestamps,
-        # instead of `len(path) * 2.5` minutes, which was a flat per-hop
-        # guess disconnected from the actual data already loaded.
-        walk_speed_mps = self.WALK_SPEED_MPS
-        total_time_mins = math.ceil(
-            (start_walk_meters / walk_speed_mps + total_transit_time_sec + end_walk_meters / walk_speed_mps) / 60
-        )
+        total_time_mins = math.ceil((start_walk_meters / self.WALK_SPEED_MPS + total_transit_time_sec + end_walk_meters / self.WALK_SPEED_MPS) / 60)
         total_distance = round(start_walk_meters + transit_distance + end_walk_meters)
 
+        metro_fare = 0
+        if metro_stops > 0:
+            if metro_stops <= 9: metro_fare = 10
+            elif metro_stops <= 16: metro_fare = 12
+            elif metro_stops <= 23: metro_fare = 15
+            else: metro_fare = 20
+
+        bus_fare = bus_boardings * 14
+        base_price = max(10, metro_fare + bus_fare)
+        
+        traffic = "Low"
+        if bus_boardings > 0: traffic = "Medium"
+        if bus_boardings > 1 and metro_stops == 0: traffic = "High"
+
+        # Tiers Formatting
+        if profile_type == "fastest":
+            price_str = f"{base_price + 5} EGP"
+            desc = f"Premium via {self.stops[start_stop_id]['name']}"
+        elif profile_type == "regular":
+            total_time_mins = math.ceil(total_time_mins * 1.15)
+            price_str = f"{base_price} EGP"
+            desc = f"Standard via {self.stops[start_stop_id]['name']}"
+        else: 
+            total_time_mins = math.ceil(total_time_mins * 1.3)
+            price_str = f"{max(10, base_price - 5)} EGP"
+            desc = f"Economy via {self.stops[start_stop_id]['name']}"
+
         return {
-            "success": True,
-            "backend_compute_time_ms": round((time.time() - calc_start_time) * 1000, 2),
-            "options": [
-                {
-                    "type": "Optimal Route",
-                    "desc": f"Transit via {self.stops[start_stop_id]['name']} to {self.stops[last_stop]['name']}",
-                    "time": str(total_time_mins),
-                    "traffic": "Medium",
-                    "distance_m": total_distance
-                }
-            ],
+            "type": profile_type.capitalize(),
+            "desc": desc,
+            "time": str(total_time_mins),
+            "price": price_str,
+            "traffic": traffic,
+            "distance_m": total_distance,
             "segments": segments,
             "instructions": instructions,
             "station_markers": station_markers
         }
 
+    def run_raptor_by_coords(self, start_lat, start_lon, end_lat, end_lon):
+        calc_start_time = time.time()
+        start_stop_id, start_walk_meters = self.find_nearest_stop(start_lat, start_lon)
+        end_stop_id, end_walk_meters = self.find_nearest_stop(end_lat, end_lon)
+
+        # Run Dijkstra 3 times with different weights
+        profiles = ["fastest", "regular", "cheapest"]
+        options = []
+        
+        for p in profiles:
+            path, _ = self._find_shortest_path(start_stop_id, end_stop_id, profile=p)
+            if path:
+                opt = self._build_option_data(path, p, start_stop_id, start_lat, start_lon, end_lat, end_lon, start_walk_meters, end_walk_meters)
+                options.append(opt)
+
+        if not options:
+            return {"success": False, "error": "No viable transit route found between these locations."}
+            
+        return {
+            "success": True,
+            "backend_compute_time_ms": round((time.time() - calc_start_time) * 1000, 2),
+            "options": options
+        }
 
 if __name__ == "__main__":
     engine = GTFSRaptorEngine(".")
